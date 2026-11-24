@@ -1,0 +1,903 @@
+-- River Hunter | นักล่าแห่งสายน้ำ Script Hub
+-- UI: Fluent (dawid-scripts)
+-- Updated: Smooth Tween System (ทวีนลอยไปแต่ละจุด + ปรับความเร็ว + Noclip กันชน)
+
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+local FishingRemotes = ReplicatedStorage:WaitForChild("FishingRemotes", 10)
+local CastRemote = FishingRemotes and FishingRemotes:WaitForChild("Cast", 5)
+local InputRemote = FishingRemotes and FishingRemotes:WaitForChild("Input", 5)
+local StateRemote = FishingRemotes and FishingRemotes:WaitForChild("State", 5)
+local TickRemote = FishingRemotes and FishingRemotes:WaitForChild("Tick", 5)
+local GarageRemote = FishingRemotes and FishingRemotes:WaitForChild("Garage", 5)
+
+local Window = Fluent:CreateWindow({
+    Title = "River Hunter | นักล่าแห่งสายน้ำ",
+    SubTitle = "by ZX2XNLO",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 520),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl
+})
+
+local Tabs = {
+    Main = Window:AddTab({ Title = "ออโต้ฟาร์ม (Main)", Icon = "fish" }),
+    Teleport = Window:AddTab({ Title = "ทวีนเดินทาง (Tween)", Icon = "map-pin" }),
+    Visuals = Window:AddTab({ Title = "ตรวจจับ & ESP", Icon = "eye" }),
+    Misc = Window:AddTab({ Title = "ทั่วไป & ตัวละคร", Icon = "user" }),
+    Settings = Window:AddTab({ Title = "ตั้งค่า (Settings)", Icon = "settings" })
+}
+
+local Options = Fluent.Options
+
+----------------------------------------------------------------------
+-- REAL-TIME FISHING & FIGHT STATE MONITORING
+----------------------------------------------------------------------
+local fightState = {
+    phase = "idle",
+    tension = 0,      -- te: Line tension (0.0 to 1.0+)
+    fishStamina = 1,  -- fs: Fish stamina
+    playerStamina = 1,-- ps: Player stamina
+    isBurst = false,  -- bu: Fish is raging/bursting
+    isSurge = false,  -- sw: Fish surge warning
+    isSnagged = false,-- sn: Stuck on log/obstacle
+    gaveUp = false,   -- gu: Fish is completely exhausted (หมดแรงแล้ว)
+    lateralDir = 0,   -- ld: Fish movement (<0 = left, >0 = right)
+    snagDir = 0,      -- sd: Snag side direction
+    lastTick = 0
+}
+
+if TickRemote then
+    TickRemote.OnClientEvent:Connect(function(data)
+        if typeof(data) == "table" then
+            if data.ph then fightState.phase = data.ph end
+            if typeof(data.te) == "number" then fightState.tension = data.te end
+            if typeof(data.fs) == "number" then fightState.fishStamina = data.fs end
+            if typeof(data.ps) == "number" then fightState.playerStamina = data.ps end
+            if data.bu ~= nil then fightState.isBurst = (data.bu == true) end
+            if data.sw ~= nil then fightState.isSurge = (data.sw == true) end
+            if data.sn ~= nil then fightState.isSnagged = (data.sn == true) end
+            if data.gu ~= nil then fightState.gaveUp = (data.gu == true) end
+            if typeof(data.ld) == "number" then fightState.lateralDir = data.ld end
+            if typeof(data.sd) == "number" then fightState.snagDir = data.sd end
+            fightState.lastTick = os.clock()
+        end
+    end)
+end
+
+----------------------------------------------------------------------
+-- TAB 1: MAIN (AUTO FISH & ECONOMY)
+----------------------------------------------------------------------
+do
+    Tabs.Main:AddParagraph({
+        Title = "สถานะระบบตกปลา",
+        Content = "ระบบตกปลาอัตโนมัติ: เหวี่ยงเบ็ด -> กรอสาย/กระตุกเหยื่อ -> ตวัดเบ็ด (ตั้งดีเลย์ได้) -> สู้ปลาเอียงคันเบ็ด + กันสายขาด -> ดึงขึ้นฝั่ง -> ขายปลา"
+    })
+
+    local AutoFishToggle = Tabs.Main:AddToggle("AutoFish", {
+        Title = "Auto Fish (เปิด/ปิด ระบบตกปลาอัตโนมัติ)",
+        Default = false
+    })
+
+    -- ระบบสู้ปลาอัจฉริยะ ป้องกันสายขาด (Smart Fight & Anti-Snap)
+    local SmartFightToggle = Tabs.Main:AddToggle("SmartFight", {
+        Title = "Smart Fight (กันสายขาด - ผ่อนรอกตอนปลาสู้)",
+        Description = "หยุดกรอสายทันทีเมื่อปลาดิ้น/แรงตึงสายสูง และกรอสายดึงเข้าเฉพาะตอนปลาเริ่มเหนื่อย เพื่อไม่ให้สายขาด",
+        Default = true
+    })
+
+    local MaxTensionSlider = Tabs.Main:AddSlider("MaxTension", {
+        Title = "Max Tension Limit (เกณฑ์แรงตึงสายสูงสุด)",
+        Description = "ระดับความตึงสายที่จะหยุดกรอสายทันทีเพื่อผ่อนรอก (แนะนำ 0.80 - 0.85)",
+        Default = 0.85,
+        Min = 0.50,
+        Max = 0.95,
+        Rounding = 2
+    })
+
+    -- ระบบเอียงคันเบ็ดอัตโนมัติ ซ้าย-ขวา (Auto Tilt / Steer)
+    local AutoSteerToggle = Tabs.Main:AddToggle("AutoSteer", {
+        Title = "Auto Tilt / Steer (เอียงคันเบ็ดอัตโนมัติ ซ้าย-ขวา)",
+        Description = "ตรวจจับทิศทางที่ปลาพุ่ง หรือจังหวะติดตอ แล้วเอียงคันเบ็ดสวนทางทันทีเพื่อลดแรงและทำให้ปลาเหนื่อยเร็วขึ้น",
+        Default = true
+    })
+
+    local FastTugToggle = Tabs.Main:AddToggle("FastTug", {
+        Title = "Fast Tug (สู้ปลาดึงรัวความเร็วสูง)",
+        Default = true
+    })
+
+    -- ดึงสู้ปลาโดยไม่กรอสายพร้อมกัน (กันสายขาด)
+    local NoReelTugToggle = Tabs.Main:AddToggle("NoReelTug", {
+        Title = "No Reel While Tugging (ดึงสู้โดยไม่กรอสาย)",
+        Description = "ตอนดึงสู้ปลา (คลิกรัว) จะไม่กรอสายไปพร้อมกัน ลดแรงตึงที่ทำให้สายขาด | สายหย่อนค่อยกรอสลับ ไม่ดึงพร้อมกรอ",
+        Default = true
+    })
+
+    local ReelBelowTensionSlider = Tabs.Main:AddSlider("ReelBelowTension", {
+        Title = "Reel Only Below Tension (กรอเฉพาะตอนแรงตึงต่ำกว่า)",
+        Description = "ใช้กับ 'ดึงสู้โดยไม่กรอสาย': แรงตึงต่ำกว่าค่านี้ถึงจะกรอสาย (ไม่ดึง) ที่ค่าสูงกว่านี้จะดึงอย่างเดียว",
+        Default = 0.50,
+        Min = 0.10,
+        Max = 0.80,
+        Rounding = 2
+    })
+
+    -- ดีเลย์การตวัดเบ็ด (Hookset Delay)
+    local HooksetDelaySlider = Tabs.Main:AddSlider("HooksetDelay", {
+        Title = "Hookset Delay (ดีเลย์ตวัดเบ็ด วินาที)",
+        Description = "ระยะเวลาหน่วงก่อนตวัดเบ็ดหลังจากปลากินเหยื่อ (0.0 = ทันที)",
+        Default = 0.1,
+        Min = 0.0,
+        Max = 1.5,
+        Rounding = 2
+    })
+
+    -- ระยะโยนเบ็ด (เวลากดค้างชาร์จแรงโยน: สั้น = ใกล้ / ยาว = ไกล)
+    local CastDistanceDropdown = Tabs.Main:AddDropdown("CastDistance", {
+        Title = "Cast Distance (ระยะโยนเบ็ด)",
+        Description = "ใกล้ = ปล่อยเร็ว / ไกล = ชาร์จนานขึ้น | กำหนดเอง = ใช้ค่าจากสไลเดอร์ด้านล่าง",
+        Values = { "ใกล้ (Near)", "กลาง (Medium)", "ไกล (Far / Perfect)", "กำหนดเอง (Custom)" },
+        Multi = false,
+        Default = "ไกล (Far / Perfect)"
+    })
+
+    local CastHoldSlider = Tabs.Main:AddSlider("CastHold", {
+        Title = "Custom Cast Hold (เวลาชาร์จโยน วินาที)",
+        Description = "ใช้เฉพาะตอนเลือก 'กำหนดเอง': ยิ่งน้อยยิ่งโยนใกล้ (ค่าเดิมของสคริปต์ = 0.55)",
+        Default = 0.55,
+        Min = 0.10,
+        Max = 1.00,
+        Rounding = 2
+    })
+
+    -- กรอสายล่อปลา (แยกออกมาเป็น Toggle)
+    local AutoReelLureToggle = Tabs.Main:AddToggle("AutoReelLure", {
+        Title = "Auto Reel Lure (กรอสายขณะล่อปลา)",
+        Description = "เปิดเพื่อให้กรอสายขณะล่อปลา (เหมาะกับกบยาง, สปูน, สปินเนอร์)",
+        Default = true
+    })
+
+    local ReelSpeedSlider = Tabs.Main:AddSlider("ReelSpeed", {
+        Title = "Reel Speed (ความเร็วการกรอสาย)",
+        Description = "ความเร็วในการกรอสายขณะล่อปลา",
+        Default = 0.7,
+        Min = 0.1,
+        Max = 1.0,
+        Rounding = 2
+    })
+
+    -- กระตุกเหยื่อ (กด E) พร้อมตั้งดีเลย์
+    local AutoJerkToggle = Tabs.Main:AddToggle("AutoJerk", {
+        Title = "Auto Jerk / Twitch (กระตุกเหยื่อ - กด E)",
+        Description = "กระตุกเหยื่ออัตโนมัติขณะล่อปลา (เหมาะกับป๊อปเปอร์, ไมโครจิ๊ก, ปลอมผิวน้ำ)",
+        Default = true
+    })
+
+    local JerkDelaySlider = Tabs.Main:AddSlider("JerkDelay", {
+        Title = "Jerk Delay (ดีเลย์กระตุกเหยื่อ วินาที)",
+        Description = "ระยะเวลาระหว่างการกระตุกเหยื่อแต่ละครั้ง",
+        Default = 1.5,
+        Min = 0.3,
+        Max = 5.0,
+        Rounding = 1
+    })
+
+    local AutoSellToggle = Tabs.Main:AddToggle("AutoSell", {
+        Title = "Auto Sell (ขายปลาอัตโนมัติเมื่อถังเต็ม)",
+        Default = false
+    })
+
+    local SellThresholdSlider = Tabs.Main:AddSlider("SellThreshold", {
+        Title = "Sell Count (ขายเมื่อปลาถึงจำนวน)",
+        Description = "จำนวนปลาในถังก่อนขายอัตโนมัติ",
+        Default = 15,
+        Min = 1,
+        Max = 30,
+        Rounding = 0
+    })
+
+    Tabs.Main:AddButton({
+        Title = "Sell Fish Now (ขายปลาในถังทันที)",
+        Description = "ส่งคำสั่งขายปลาทั้งหมดที่แผงขายทันที",
+        Callback = function()
+            if InputRemote then
+                InputRemote:FireServer("sell", {all = true})
+                Fluent:Notify({
+                    Title = "ตลาดปลา",
+                    Content = "ส่งคำสั่งขายปลาทั้งหมดเรียบร้อยแล้ว",
+                    Duration = 3
+                })
+            end
+        end
+    })
+end
+
+----------------------------------------------------------------------
+-- HOOKSET FUNCTION WITH CONFIGURABLE DELAY (ตวัดเบ็ดแบบตั้งดีเลย์ได้)
+----------------------------------------------------------------------
+local lastHooksetTime = 0
+local isHooksetting = false
+
+local function triggerHookset()
+    local now = os.clock()
+    if isHooksetting or (now - lastHooksetTime < 0.35) then return end
+    isHooksetting = true
+    lastHooksetTime = now
+
+    task.spawn(function()
+        local delayVal = (Options.HooksetDelay and Options.HooksetDelay.Value) or 0
+        if delayVal > 0 then
+            task.wait(delayVal)
+        end
+
+        -- 1. ยิง Remote คำสั่ง hookset ไปยังเซิร์ฟเวอร์
+        if InputRemote then
+            InputRemote:FireServer("hookset")
+        end
+
+        -- 2. จำลองการกดปุ่ม E เพื่อให้แอนิเมชันและไคลเอนต์ทำงานสอดคล้องกันทันที
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.02)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+
+        task.wait(0.15)
+        isHooksetting = false
+    end)
+end
+
+-- Listener 1: State Remote
+if StateRemote then
+    StateRemote.OnClientEvent:Connect(function(a1, a2)
+        if a1 == "strike" then
+            if Options.AutoFish and Options.AutoFish.Value then
+                triggerHookset()
+            end
+        end
+    end)
+end
+
+-- Listener 2: Tick Remote
+if TickRemote then
+    TickRemote.OnClientEvent:Connect(function(data)
+        if typeof(data) == "table" and data.ph == "strike" then
+            if Options.AutoFish and Options.AutoFish.Value then
+                triggerHookset()
+            end
+        end
+    end)
+end
+
+-- Listener 3: Player Attribute Signal
+LocalPlayer:GetAttributeChangedSignal("FishPhase"):Connect(function()
+    local phase = LocalPlayer:GetAttribute("FishPhase")
+    if phase == "strike" then
+        if Options.AutoFish and Options.AutoFish.Value then
+            triggerHookset()
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- HELPER FUNCTIONS FOR CASTING & STEERING
+----------------------------------------------------------------------
+local function getCastButton()
+    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+    if pgui then
+        local fishingUI = pgui:FindFirstChild("FishingUI")
+        if fishingUI then
+            local reel = fishingUI:FindFirstChild("Reel")
+            if reel then
+                return reel:FindFirstChild("Main")
+            end
+        end
+    end
+    return nil
+end
+
+-- เวลากดค้างชาร์จแรงโยน (วินาที) ตามระยะที่เลือก
+local CAST_HOLD_PRESETS = {
+    ["ใกล้ (Near)"] = 0.20,
+    ["กลาง (Medium)"] = 0.38,
+    ["ไกล (Far / Perfect)"] = 0.55, -- ค่าเดิมของสคริปต์ (ชาร์จถึงช่อง perfect)
+}
+
+local function getCastHold()
+    local choice = Options.CastDistance and Options.CastDistance.Value
+    if choice == "กำหนดเอง (Custom)" then
+        local v = Options.CastHold and tonumber(Options.CastHold.Value)
+        if v then
+            return math.clamp(v, 0.05, 1.5)
+        end
+    end
+    return CAST_HOLD_PRESETS[choice] or 0.55
+end
+
+local function performCast()
+    local btn = getCastButton()
+    if btn then
+        local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        task.wait(getCastHold()) -- charge time = cast distance
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end
+end
+
+-- ควบคุมการเอียงคันเบ็ด (Steer / Tilt Rod)
+local currentSteer = 0
+local function updateSteer(targetSteer)
+    if currentSteer == targetSteer then return end
+    currentSteer = targetSteer
+
+    if InputRemote then
+        InputRemote:FireServer("steer", targetSteer)
+    end
+
+    -- จำลองการกดปุ่ม A / D ให้ตัวละครเอียงคันเบ็ดตามทิศทาง
+    if targetSteer > 0 then
+        -- เอียงขวา (Tilt Right)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.A, false, game)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.D, false, game)
+    elseif targetSteer < 0 then
+        -- เอียงซ้าย (Tilt Left)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.D, false, game)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.A, false, game)
+    else
+        -- คืนตำแหน่งตรงกลาง
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.A, false, game)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.D, false, game)
+    end
+end
+
+----------------------------------------------------------------------
+-- AUTO FISH & FIGHT BACKGROUND LOOP
+----------------------------------------------------------------------
+-- ส่งคำสั่งสู้ปลา: ดึง (pull) กับ กรอ (reel) ไม่ทำพร้อมกัน เว้นแต่ปลาหมดแรง
+local function fightInput(pullRate, exhausted)
+    if not InputRemote then return end
+
+    local noReel = Options.NoReelTug and Options.NoReelTug.Value
+    if not noReel or exhausted then
+        -- แบบเดิม (หรือปลาหมดแรงแล้ว สายปลอดภัย): ดึงพร้อมกรอ
+        InputRemote:FireServer("pull", pullRate)
+        InputRemote:FireServer("reel", 1)
+        return
+    end
+
+    local reelBelow = Options.ReelBelowTension and Options.ReelBelowTension.Value or 0.5
+    local slack = fightState.tension <= reelBelow
+        and not fightState.isBurst and not fightState.isSurge and not fightState.isSnagged
+    if slack then
+        -- สายหย่อน: กรอสายเข้าอย่างเดียว ไม่ดึง
+        InputRemote:FireServer("reel", 1)
+    else
+        -- ดึงสู้ปลา: ปล่อยรอกไว้ ไม่กรอ
+        InputRemote:FireServer("pull", pullRate)
+        InputRemote:FireServer("reel", 0)
+    end
+end
+
+local lastJerkTime = 0
+local lastCastTime = 0
+
+task.spawn(function()
+    while true do
+        task.wait(0.05) -- Fast non-blocking tick (50ms)
+        if Fluent.Unloaded then break end
+
+        if not Options.AutoFish or not Options.AutoFish.Value then
+            if currentSteer ~= 0 then
+                updateSteer(0)
+            end
+            continue
+        end
+
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hum or not hrp or hum.Health <= 0 then continue end
+
+        -- ตรวจสอบและถือคันเบ็ด
+        local rodInHand = char:FindFirstChild("คันเบ็ด") or char:FindFirstChildOfClass("Tool")
+        if not rodInHand then
+            local rodInBag = LocalPlayer.Backpack:FindFirstChild("คันเบ็ด")
+            if rodInBag then
+                hum:EquipTool(rodInBag)
+                task.wait(0.4)
+            end
+        end
+
+        local phase = LocalPlayer:GetAttribute("FishPhase") or "idle"
+        local now = os.clock()
+
+        -- Auto Sell check (เมื่ออยู่ในสถานะว่าง idle)
+        if Options.AutoSell and Options.AutoSell.Value and phase == "idle" then
+            local bucketN = tonumber(LocalPlayer:GetAttribute("BucketN")) or 0
+            local target = tonumber(Options.SellThreshold.Value) or 15
+            if bucketN >= target then
+                if InputRemote then
+                    InputRemote:FireServer("sell", {all = true})
+                    task.wait(0.8)
+                end
+            end
+        end
+
+        if phase == "idle" then
+            if currentSteer ~= 0 then
+                updateSteer(0)
+            end
+            if now - lastCastTime > 1.2 then
+                lastCastTime = now
+                performCast()
+            end
+
+        elseif phase == "flight" or phase == "pending" then
+            lastJerkTime = now
+            if currentSteer ~= 0 then
+                updateSteer(0)
+            end
+
+        elseif phase == "lure" then
+            if currentSteer ~= 0 then
+                updateSteer(0)
+            end
+
+            -- 1. Auto Jerk / Twitch (กระตุกเหยื่อ - กด E)
+            if Options.AutoJerk and Options.AutoJerk.Value then
+                local jDelay = Options.JerkDelay and Options.JerkDelay.Value or 1.5
+                if now - lastJerkTime >= jDelay then
+                    lastJerkTime = now
+                    if InputRemote then
+                        InputRemote:FireServer("jerk")
+                    end
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                    task.defer(function()
+                        task.wait(0.02)
+                        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                    end)
+                end
+            end
+
+            -- 2. Auto Reel (กรอสายล่อปลา)
+            if Options.AutoReelLure and Options.AutoReelLure.Value then
+                local rSpeed = Options.ReelSpeed and Options.ReelSpeed.Value or 0.7
+                if InputRemote then
+                    InputRemote:FireServer("reel", rSpeed)
+                end
+            else
+                if InputRemote then
+                    InputRemote:FireServer("reel", 0)
+                end
+            end
+
+        elseif phase == "strike" then
+            triggerHookset()
+
+        elseif phase == "fight" then
+            local smartFight = Options.SmartFight and Options.SmartFight.Value
+            local maxTension = Options.MaxTension and Options.MaxTension.Value or 0.85
+            local autoSteer = Options.AutoSteer and Options.AutoSteer.Value
+
+            -- [1] AUTO TILT / STEER (เอียงคันเบ็ด ซ้าย-ขวา)
+            if autoSteer then
+                if fightState.isSnagged then
+                    -- ติดตอ (Snagged): เอียงตามทิศทางปลดตอ
+                    if fightState.snagDir < 0 then
+                        updateSteer(-1)
+                    elseif fightState.snagDir > 0 then
+                        updateSteer(1)
+                    end
+                elseif fightState.gaveUp then
+                    updateSteer(0)
+                else
+                    local ld = fightState.lateralDir
+                    if ld < -0.06 then
+                        updateSteer(1)  -- ปลาว่ายไปซ้าย -> เอียงคันสวนไปทางขวา ▶
+                    elseif ld > 0.06 then
+                        updateSteer(-1) -- ปลาว่ายไปขวา -> เอียงคันสวนไปทางซ้าย ◀
+                    else
+                        updateSteer(0)
+                    end
+                end
+            end
+
+            -- [2] SMART ANTI-SNAP (ป้องกันสายขาด)
+            if smartFight then
+                local isDanger = (fightState.tension >= maxTension) or fightState.isBurst or fightState.isSurge or fightState.isSnagged
+                local isExhausted = fightState.gaveUp or (fightState.fishStamina <= 0.2 and not fightState.isBurst)
+
+                if isDanger and not isExhausted then
+                    -- ผ่อนรอกทันทีเพื่อป้องกันสายขาด!
+                    if InputRemote then
+                        InputRemote:FireServer("reel", 0)
+                    end
+                    task.wait(0.04)
+                else
+                    -- ปลอดภัย / ปลาเริ่มหมดแรง: กรอสายและดึงสู้ปลา
+                    local pullRate = (Options.FastTug and Options.FastTug.Value) and 0.07 or 0.12
+                    fightInput(pullRate, isExhausted)
+                end
+            else
+                local pullRate = (Options.FastTug and Options.FastTug.Value) and 0.07 or 0.12
+                fightInput(pullRate, false)
+            end
+
+        elseif phase == "landing" then
+            if currentSteer ~= 0 then
+                updateSteer(0)
+            end
+            if InputRemote then
+                InputRemote:FireServer("land")
+                InputRemote:FireServer("reel", 0)
+            end
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- TAB 2: TWEEN TRAVEL (ระบบทวีนเดินทางลอยไปแต่ละจุด)
+----------------------------------------------------------------------
+do
+    Tabs.Teleport:AddParagraph({
+        Title = "ระบบทวีนเดินทาง (Tween System)",
+        Content = "เดินทางไปยังจุดต่าง ๆ อย่างนุ่มนวลด้วย TweenService พร้อมระบบ Noclip ลอยทะลุสิ่งกีดขวาง ไม่หลุดตกแมพ และไม่โดนระบบตรวจสอบระยะทาง"
+    })
+
+    local TweenSpeedSlider = Tabs.Teleport:AddSlider("TweenSpeed", {
+        Title = "Tween Speed (ความเร็วการทวีน)",
+        Description = "ความเร็วในการบิน/ทวีนไปยังจุดหมาย (Studs/วินาที)",
+        Default = 60,
+        Min = 20,
+        Max = 150,
+        Rounding = 0
+    })
+
+    local locations = {
+        ["ตลาดปลา (Fish Market)"] = Vector3.new(-31.6, 7.4, 197.8),
+        ["ท่าเรือแพตกปลา (Bait Raft Pier)"] = Vector3.new(-8.6, 4.5, 73.1),
+        ["ร้านก๋วยเตี๋ยวริมน้ำ (Noodle Landing)"] = Vector3.new(29.6, 3.5, 180),
+        ["อ่างเก็บน้ำ (Reservoir)"] = Vector3.new(0, 10, -450),
+        ["สันเขื่อน (Dam Crest)"] = Vector3.new(0, 16, -160),
+        ["ร้านกาแฟริมทาง (Coffee Shop)"] = Vector3.new(-366.7, 18.4, -161),
+        ["แม่น้ำสายหลัก (Main River)"] = Vector3.new(0, 5, 800),
+        ["แม่น้ำตอนล่าง (Downstream)"] = Vector3.new(0, 5, 1200)
+    }
+
+    local locationKeys = {
+        "ตลาดปลา (Fish Market)",
+        "ท่าเรือแพตกปลา (Bait Raft Pier)",
+        "ร้านก๋วยเตี๋ยวริมน้ำ (Noodle Landing)",
+        "อ่างเก็บน้ำ (Reservoir)",
+        "สันเขื่อน (Dam Crest)",
+        "ร้านกาแฟริมทาง (Coffee Shop)",
+        "แม่น้ำสายหลัก (Main River)",
+        "แม่น้ำตอนล่าง (Downstream)",
+        "บ้านของฉัน (My Plot)"
+    }
+
+    local ZoneDropdown = Tabs.Teleport:AddDropdown("ZoneSelect", {
+        Title = "เลือกจุดหมาย",
+        Values = locationKeys,
+        Multi = false,
+        Default = "ตลาดปลา (Fish Market)"
+    })
+
+    -- ตัวแปรควบคุมการทวีน
+    local currentTween = nil
+    local isTweening = false
+    local currentBV = nil
+    local noclipConn = nil
+
+    local function stopTween()
+        if currentTween then
+            currentTween:Cancel()
+            currentTween = nil
+        end
+        isTweening = false
+        if currentBV and currentBV.Parent then
+            currentBV:Destroy()
+            currentBV = nil
+        end
+        if noclipConn then
+            noclipConn:Disconnect()
+            noclipConn = nil
+        end
+        -- คืนค่าการชนกันของตัวละคร
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end
+
+    local function tweenTo(targetCFrame)
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then return end
+
+        stopTween()
+
+        local speed = (Options.TweenSpeed and Options.TweenSpeed.Value) or 60
+        local distance = (targetCFrame.Position - hrp.Position).Magnitude
+        local duration = math.max(0.2, distance / speed)
+
+        -- ตรึงความเร็วป้องกันตัวละครตกลงสู่พื้นขณะทวีน
+        currentBV = Instance.new("BodyVelocity")
+        currentBV.Velocity = Vector3.new(0, 0, 0)
+        currentBV.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+        currentBV.Parent = hrp
+
+        isTweening = true
+
+        -- ระบบ Noclip ขณะทวีน เพื่อให้ลอยทะลุต้นไม้ หิน สิ่งปลูกสร้างได้นุ่มนวล
+        noclipConn = RunService.Stepped:Connect(function()
+            if not isTweening or not char then
+                if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+                return
+            end
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+        end)
+
+        local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+        currentTween = TweenService:Create(hrp, tweenInfo, {CFrame = targetCFrame})
+
+        currentTween.Completed:Connect(function(playbackState)
+            if playbackState == Enum.PlaybackState.Completed then
+                Fluent:Notify({
+                    Title = "การเดินทาง",
+                    Content = "ทวีนถึงจุดหมายเรียบร้อยแล้ว!",
+                    Duration = 3
+                })
+            end
+            stopTween()
+        end)
+
+        currentTween:Play()
+
+        Fluent:Notify({
+            Title = "กำลังทวีน...",
+            Content = string.format("ระยะทาง: %.0f studs (ใช้เวลา ~%.1f วิ)", distance, duration),
+            Duration = 3
+        })
+    end
+
+    Tabs.Teleport:AddButton({
+        Title = "ทวีนไปยังจุดที่เลือก (Start Tween)",
+        Callback = function()
+            local selected = Options.ZoneSelect.Value
+            if selected == "บ้านของฉัน (My Plot)" then
+                local plotNum = LocalPlayer:GetAttribute("Plot")
+                local plot = workspace:FindFirstChild("Town") and workspace.Town:FindFirstChild("Plots") and workspace.Town.Plots:FindFirstChild("Plot" .. tostring(plotNum))
+                if plot then
+                    tweenTo(plot:GetPivot() + Vector3.new(0, 3, 0))
+                else
+                    Fluent:Notify({ Title = "Tween", Content = "ไม่พบตำแหน่งแปลงที่ดิน", Duration = 3 })
+                end
+            elseif locations[selected] then
+                tweenTo(CFrame.new(locations[selected]))
+            end
+        end
+    })
+
+    Tabs.Teleport:AddButton({
+        Title = "หยุดทวีน (Stop / Cancel Tween)",
+        Description = "กดยกเลิกการทวีนค้างกลางทางทันที",
+        Callback = function()
+            stopTween()
+            Fluent:Notify({ Title = "Tween", Content = "ยกเลิกการทวีนเรียบร้อยแล้ว", Duration = 2 })
+        end
+    })
+
+    Tabs.Teleport:AddButton({
+        Title = "ทวีนไปตลาดปลาทันที (Quick Market)",
+        Callback = function()
+            tweenTo(CFrame.new(locations["ตลาดปลา (Fish Market)"]))
+        end
+    })
+
+    Tabs.Teleport:AddButton({
+        Title = "ทวีนกลับบ้านทันที (Quick Home)",
+        Callback = function()
+            local plotNum = LocalPlayer:GetAttribute("Plot")
+            local plot = workspace:FindFirstChild("Town") and workspace.Town:FindFirstChild("Plots") and workspace.Town.Plots:FindFirstChild("Plot" .. tostring(plotNum))
+            if plot then
+                tweenTo(plot:GetPivot() + Vector3.new(0, 3, 0))
+            end
+        end
+    })
+end
+
+----------------------------------------------------------------------
+-- TAB 3: VISUALS & ESP
+----------------------------------------------------------------------
+do
+    local BossAlertToggle = Tabs.Visuals:AddToggle("BossAlert", {
+        Title = "Boss Alert (แจ้งเตือนบอสแม่น้ำ)",
+        Default = true
+    })
+
+    local RadarToggle = Tabs.Visuals:AddToggle("RadarMode", {
+        Title = "Water Radar (เปิดเรดาร์ตรวจคุณภาพน้ำ)",
+        Default = false
+    })
+
+    RadarToggle:OnChanged(function()
+        if InputRemote then
+            InputRemote:FireServer("radarSwap", Options.RadarMode.Value)
+        end
+    end)
+
+    if StateRemote then
+        StateRemote.OnClientEvent:Connect(function(a1, a2)
+            if Options.BossAlert and Options.BossAlert.Value then
+                if a1 == "announce" and typeof(a2) == "table" and a2.k == "announce.outBoss" then
+                    local p = a2.p
+                    local bossName = p and tostring(p.boss) or "บอส"
+                    local zoneName = p and tostring(p.zone) or "แม่น้ำ"
+                    Fluent:Notify({
+                        Title = "🚨 บอสแม่น้ำเกิด!",
+                        Content = "พบ " .. bossName .. " ที่โซน " .. zoneName,
+                        Duration = 10
+                    })
+                elseif a1 == "bossTrack" and typeof(a2) == "table" and a2.id then
+                    Fluent:Notify({
+                        Title = "📍 ตรวจพบบอสในรัศมี",
+                        Content = "บอส: " .. tostring(a2.id),
+                        Duration = 5
+                    })
+                end
+            end
+        end)
+    end
+end
+
+----------------------------------------------------------------------
+-- TAB 4: MISC & CHARACTER
+----------------------------------------------------------------------
+do
+    Tabs.Misc:AddParagraph({
+        Title = "ยานพาหนะ",
+        Content = "เสกเรือและสัตว์พาหนะได้ทันที"
+    })
+
+    Tabs.Misc:AddButton({
+        Title = "เรียกเรือ (Spawn Longtail Boat)",
+        Callback = function()
+            if GarageRemote then
+                GarageRemote:FireServer("boat", "longtail")
+                Fluent:Notify({ Title = "Vehicle", Content = "เรียกเรือสำเร็จ", Duration = 3 })
+            end
+        end
+    })
+
+    Tabs.Misc:AddButton({
+        Title = "เก็บเรือ (Despawn Boat)",
+        Callback = function()
+            if GarageRemote then
+                GarageRemote:FireServer("boatAway")
+            end
+        end
+    })
+
+    Tabs.Misc:AddButton({
+        Title = "เรียกช้างมารับ (Call Elephant)",
+        Callback = function()
+            if GarageRemote then
+                GarageRemote:FireServer("elephantCome")
+                Fluent:Notify({ Title = "Vehicle", Content = "เรียกช้างสำเร็จ", Duration = 3 })
+            end
+        end
+    })
+
+    Tabs.Misc:AddParagraph({
+        Title = "ปรับแต่งตัวละคร",
+        Content = "ความเร็วเดินและแรงกระโดด"
+    })
+
+    local WalkSpeedSlider = Tabs.Misc:AddSlider("WalkSpeed", {
+        Title = "WalkSpeed (ความเร็วเดิน)",
+        Default = 16,
+        Min = 16,
+        Max = 120,
+        Rounding = 0,
+        Callback = function(val)
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = val
+            end
+        end
+    })
+
+    local JumpPowerSlider = Tabs.Misc:AddSlider("JumpPower", {
+        Title = "JumpPower (แรงกระโดด)",
+        Default = 50,
+        Min = 50,
+        Max = 200,
+        Rounding = 0,
+        Callback = function(val)
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.UseJumpPower = true
+                hum.JumpPower = val
+            end
+        end
+    })
+
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if Fluent.Unloaded then break end
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                if Options.WalkSpeed and Options.WalkSpeed.Value > 16 then
+                    if hum.WalkSpeed ~= Options.WalkSpeed.Value then
+                        hum.WalkSpeed = Options.WalkSpeed.Value
+                    end
+                end
+                if Options.JumpPower and Options.JumpPower.Value > 50 then
+                    hum.UseJumpPower = true
+                    if hum.JumpPower ~= Options.JumpPower.Value then
+                        hum.JumpPower = Options.JumpPower.Value
+                    end
+                end
+            end
+        end
+    end)
+
+    Tabs.Misc:AddParagraph({
+        Title = "รางวัลสารานุกรมปลา",
+        Content = "กดรับรางวัลปลาในสมุดบันทึกทั้งหมด"
+    })
+
+    Tabs.Misc:AddButton({
+        Title = "Claim All Fish Book (รับรางวัลปลาทั้งหมด)",
+        Callback = function()
+            if InputRemote then
+                local fishList = {"chado", "barb", "catfish", "channa", "kasong", "plajad", "redtilapia", "tilapia", "featherback", "pacu", "peacockbass", "carp", "gourami"}
+                for _, f in ipairs(fishList) do
+                    InputRemote:FireServer("bookClaim", f)
+                    task.wait(0.05)
+                end
+                Fluent:Notify({ Title = "Fish Book", Content = "กดรับรางวัลสารานุกรมปลาสำเร็จ", Duration = 3 })
+            end
+        end
+    })
+end
+
+----------------------------------------------------------------------
+-- TAB 5: SETTINGS & CONFIG
+----------------------------------------------------------------------
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+InterfaceManager:SetFolder("FluentScriptHub")
+SaveManager:SetFolder("FluentScriptHub/RiverHunter")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+Window:SelectTab(1)
+Fluent:Notify({
+    Title = "River Hunter Script",
+    Content = "อัปเดตระบบทวีนเดินทาง (Tween System) เรียบร้อยแล้ว!",
+    Duration = 5
+})
+SaveManager:LoadAutoloadConfig()
